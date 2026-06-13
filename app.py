@@ -2,6 +2,8 @@ from flask import Flask, request, jsonify, send_file, render_template
 from flask_cors import CORS
 import os, uuid, json, re, glob, threading, time, shutil, subprocess
 import requests as req_lib
+import socket, ipaddress
+from urllib.parse import urlparse
 from collections import defaultdict
 
 try:
@@ -93,8 +95,31 @@ _SNAP_RE = re.compile(
     r'(?:spotlight|p|t|s|add)/[\w\-./]+',
     re.IGNORECASE)
 
+def _host_is_allowed(url, domain):
+    """Host must be exactly `domain` or a subdomain of it, over http(s). Closes
+    the SSRF where the allowlist regex matched the domain inside a path/query of
+    an attacker- or internal-pointing URL (e.g. http://169.254.169.254/{d}/...)."""
+    try:
+        p = urlparse(url)
+    except Exception:
+        return False
+    if p.scheme not in ('http', 'https'):
+        return False
+    host = (p.hostname or '').rstrip('.').lower()
+    if not (host == domain or host.endswith('.' + domain)):
+        return False
+    try:  # defense in depth: reject hosts that resolve to non-public IPs
+        for info in socket.getaddrinfo(host, None):
+            ip = ipaddress.ip_address(info[4][0])
+            if (ip.is_private or ip.is_loopback or ip.is_link_local
+                    or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
+                return False
+    except Exception:
+        pass
+    return True
+
 def is_valid_url(url):
-    return bool(_SNAP_RE.search(url))
+    return _host_is_allowed(url, 'snapchat.com') and bool(_SNAP_RE.search(url))
 
 def normalize_url(url):
     url = url.strip()
