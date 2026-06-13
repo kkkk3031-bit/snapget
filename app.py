@@ -64,6 +64,10 @@ def _load_job_from_disk(job_id):
         return None
 
 def _load_all_jobs():
+    """Restore jobs after a restart. Reschedule cleanup for finished downloads so
+    files that outlived their per-job cleanup thread still expire (otherwise they
+    leak in DOWNLOAD_DIR forever). Called after schedule_cleanup is defined."""
+    now = time.time()
     for p in glob.glob(os.path.join(DOWNLOAD_DIR, 'job_*.json')):
         try:
             with open(p) as f:
@@ -73,13 +77,21 @@ def _load_all_jobs():
                 job['status'] = 'error'
                 job['error']  = 'Server restarted. Please try again.'
                 _save_job(job_id, job)
-            if job.get('status') == 'done' and not os.path.exists(job.get('file', '')):
-                os.remove(p); continue
+            if job.get('status') == 'done':
+                fpath = job.get('file', '')
+                if not fpath or not os.path.exists(fpath):
+                    os.remove(p); continue
+                remaining = FILE_TTL - (now - os.path.getmtime(fpath))
+                if remaining <= 0:
+                    try: os.remove(fpath)
+                    except Exception: pass
+                    os.remove(p); continue
+                jobs[job_id] = job
+                schedule_cleanup(job_id, fpath, delay=remaining)
+                continue
             jobs[job_id] = job
         except Exception:
             pass
-
-_load_all_jobs()
 
 
 # ── URL helpers ───────────────────────────────────────────────────────────────
@@ -205,9 +217,9 @@ def _set_job(job_id, updates):
         jobs[job_id].update(updates)
         _save_job(job_id, jobs[job_id])
 
-def schedule_cleanup(job_id, path):
+def schedule_cleanup(job_id, path, delay=FILE_TTL):
     def _cleanup():
-        time.sleep(FILE_TTL)
+        time.sleep(delay)
         try:
             if os.path.isfile(path):  os.remove(path)
             elif os.path.isdir(path): shutil.rmtree(path, ignore_errors=True)
@@ -216,6 +228,8 @@ def schedule_cleanup(job_id, path):
         except Exception: pass
         with jobs_lock: jobs.pop(job_id, None)
     threading.Thread(target=_cleanup, daemon=True).start()
+
+_load_all_jobs()  # restore + reschedule cleanup now that schedule_cleanup exists
 
 def do_download(job_id, url, title, fmt):
     _set_job(job_id, {'status': 'processing', 'progress': 5})
